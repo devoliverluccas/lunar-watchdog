@@ -1,0 +1,75 @@
+# External watchdog for the Lunar panel and sites. Runs outside every VPS, so it still speaks when a server dies.
+# Alerts once per state change (down → up), via Telegram when TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID secrets exist; a
+# failed run (GitHub e-mails the owner) marks every new outage as a fallback.
+name: watchdog
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check targets
+        id: check
+        run: |
+          set -u
+          down=""
+          while IFS= read -r line; do
+            url="${line%%#*}"; url="$(echo "$url" | xargs)"
+            [ -z "$url" ] && continue
+            ok=0
+            for attempt in 1 2 3; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 -L "$url" || echo 000)
+              if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then ok=1; break; fi
+              sleep 15
+            done
+            if [ "$ok" = 1 ]; then echo "UP   $url"; else echo "DOWN $url ($code)"; down="$down$url ($code)\n"; fi
+          done < targets.txt
+          printf "%b" "$down" | sort > now.txt
+          touch state.txt
+          new=$(comm -13 <(cut -d' ' -f1 state.txt | sort) <(cut -d' ' -f1 now.txt | sort) || true)
+          back=$(comm -23 <(cut -d' ' -f1 state.txt | sort) <(cut -d' ' -f1 now.txt | sort) || true)
+          { echo "new<<EOF"; echo "$new"; echo "EOF"; echo "back<<EOF"; echo "$back"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          cp now.txt state.txt
+
+      - name: Telegram
+        if: steps.check.outputs.new != '' || steps.check.outputs.back != ''
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW: ${{ steps.check.outputs.new }}
+          BACK: ${{ steps.check.outputs.back }}
+        run: |
+          [ -z "$TOKEN" ] || [ -z "$CHAT" ] && { echo "Telegram não configurado"; exit 0; }
+          msg=""
+          [ -n "$NEW" ] && msg="🔴 FORA DO AR (vigia externo):\n$NEW\n"
+          [ -n "$BACK" ] && msg="$msg🟢 Voltou:\n$BACK"
+          curl -s -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$CHAT" --data-urlencode "text=$(printf "%b" "$msg")" > /dev/null
+
+      - name: Save state
+        run: |
+          git config user.name "watchdog"; git config user.email "watchdog@users.noreply.github.com"
+          # Monthly heartbeat commit keeps GitHub from disabling the schedule after 60 idle days.
+          date -u +%Y-%m > last-month.txt
+          git add state.txt last-month.txt
+          git diff --cached --quiet || { git commit -q -m "watchdog: estado"; git push -q; }
+
+      - name: Fail on new outage (GitHub e-mail as fallback alert)
+        if: steps.check.outputs.new != ''
+        run: |
+          echo "::error::Fora do ar: ${{ steps.check.outputs.new }}"
+          exit 1

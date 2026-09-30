@@ -1,0 +1,4 @@
+# Um alvo por linha (HTTP 2xx/3xx = ok). O painel expõe o worker em /health/worker (503 se parou).
+https://painel.softlunar.com.br/health/ready
+https://painel.softlunar.com.br/health/worker
+https://softlunar.com.br
